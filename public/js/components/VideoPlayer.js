@@ -875,9 +875,18 @@ class VideoPlayer {
             if (this.settings.autoTranscode) {
                 console.log('[Player] Auto Transcode enabled. Probing stream...');
                 try {
-                    const probeRes = await fetch(`/api/probe?url=${encodeURIComponent(streamUrl)}`);
-                    const info = await probeRes.json();
-                    console.log(`[Player] Probe result: video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
+                    const info = await this.fetchProbeWithProgress(streamUrl);
+                    console.log(`[Player] Probe result: status=${info.status}, video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
+
+                    // Probe-gated playback: if the server says the stream is unreachable
+                    // (channel offline, rate limited, timed out), surface a clear message
+                    // instead of starting a doomed transcode at max resolution.
+                    if (info.status === 'unavailable') {
+                        this.updateTranscodeStatus('hidden');
+                        this.loadingSpinner?.classList.remove('show');
+                        this.showError(this.probeReasonToMessage(info.reason));
+                        return;
+                    }
 
                     // Store probe result for quality badge display
                     this.currentStreamInfo = info;
@@ -1451,6 +1460,46 @@ class VideoPlayer {
     showError(message) {
         this.overlay.classList.remove('hidden');
         this.overlay.querySelector('.overlay-content').innerHTML = `<p style="color: var(--color-error);">${message}</p>`;
+    }
+
+    /**
+     * Fetch /api/probe and show progressive status text while it runs.
+     * Server-side probe retries with 5s/15s/25s tiers; the timer below picks
+     * thresholds that roughly track those tier transitions so the user sees
+     * "something is happening" instead of a frozen spinner.
+     */
+    async fetchProbeWithProgress(streamUrl) {
+        const start = Date.now();
+        const tick = () => {
+            const elapsed = Date.now() - start;
+            let text;
+            if (elapsed < 5000) text = 'Connecting…';
+            else if (elapsed < 15000) text = 'Stream slow to respond, retrying…';
+            else if (elapsed < 25000) text = 'Still trying…';
+            else text = 'Almost there…';
+            this.updateTranscodeStatus('probing', text);
+        };
+        tick();
+        const timer = setInterval(tick, 1000);
+        try {
+            const res = await fetch(`/api/probe?url=${encodeURIComponent(streamUrl)}`);
+            return await res.json();
+        } finally {
+            clearInterval(timer);
+        }
+    }
+
+    probeReasonToMessage(reason) {
+        switch (reason) {
+            case 'channel_offline':
+                return 'Channel currently offline. Try another channel.';
+            case 'rate_limited':
+                return 'Connection limit reached. Close other streams and try again.';
+            case 'timeout':
+                return 'Stream not responding. Try again in a moment.';
+            default:
+                return "Couldn't reach stream. Try again later.";
+        }
     }
 
     /**

@@ -416,6 +416,9 @@ class WatchPage {
         // Stop any existing playback
         this.stop();
 
+        // Clear any error left over from a previous failed play attempt
+        this.clearError();
+
         // Show loading spinner
         this.showLoading();
 
@@ -437,9 +440,18 @@ class WatchPage {
             console.log('[WatchPage] Auto Transcode enabled. Probing stream...');
             try {
                 const ua = settings.userAgentPreset === 'custom' ? settings.userAgentCustom : settings.userAgentPreset;
-                const probeRes = await fetch(`/api/probe?url=${encodeURIComponent(url)}&ua=${encodeURIComponent(ua || '')}`);
-                const info = await probeRes.json();
-                console.log(`[WatchPage] Probe result: video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
+                const info = await this.fetchProbeWithProgress(url, ua);
+                console.log(`[WatchPage] Probe result: status=${info.status}, video=${info.video}, audio=${info.audio}, ${info.width}x${info.height}, compatible=${info.compatible}`);
+
+                // Probe-gated playback: if the server says the stream is unreachable
+                // (channel offline, rate limited, timed out), surface a clear message
+                // instead of starting a doomed transcode at max resolution.
+                if (info.status === 'unavailable') {
+                    this.updateTranscodeStatus('hidden');
+                    this.hideLoading();
+                    this.showError(this.probeReasonToMessage(info.reason));
+                    return;
+                }
 
                 // Store early probe info for quality display
                 this.currentStreamInfo = info;
@@ -857,6 +869,74 @@ class WatchPage {
         const error = this.video?.error;
         if (error && error.code) {
             console.error('[WatchPage] Video error:', error.code, error.message);
+        }
+    }
+
+    /**
+     * Display a user-facing error message in place of the video.
+     * Lazily creates the element on first use; cleared via clearError() on next play.
+     */
+    showError(message) {
+        this.hideLoading();
+        this.updateTranscodeStatus('hidden');
+        this.video?.classList.add('hidden');
+
+        let el = document.getElementById('watch-error');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'watch-error';
+            el.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:2rem;background:#000;color:var(--color-error,#e53e3e);font-size:1.1rem;z-index:5;pointer-events:none;';
+            const section = this.video?.parentElement;
+            if (section) section.appendChild(el);
+        }
+        el.textContent = message;
+        el.classList.remove('hidden');
+        el.style.display = 'flex';
+    }
+
+    clearError() {
+        const el = document.getElementById('watch-error');
+        if (el) el.style.display = 'none';
+        this.video?.classList.remove('hidden');
+    }
+
+    /**
+     * Fetch /api/probe and show progressive status text while it runs.
+     * Server-side probe retries with 5s/15s/25s tiers; the timer below picks
+     * thresholds that roughly track those tier transitions so the user sees
+     * "something is happening" instead of a frozen spinner.
+     */
+    async fetchProbeWithProgress(streamUrl, ua) {
+        const start = Date.now();
+        const tick = () => {
+            const elapsed = Date.now() - start;
+            let text;
+            if (elapsed < 5000) text = 'Connecting…';
+            else if (elapsed < 15000) text = 'Stream slow to respond, retrying…';
+            else if (elapsed < 25000) text = 'Still trying…';
+            else text = 'Almost there…';
+            this.updateTranscodeStatus('probing', text);
+        };
+        tick();
+        const timer = setInterval(tick, 1000);
+        try {
+            const res = await fetch(`/api/probe?url=${encodeURIComponent(streamUrl)}&ua=${encodeURIComponent(ua || '')}`);
+            return await res.json();
+        } finally {
+            clearInterval(timer);
+        }
+    }
+
+    probeReasonToMessage(reason) {
+        switch (reason) {
+            case 'channel_offline':
+                return 'Stream currently unavailable. Try another or check back later.';
+            case 'rate_limited':
+                return 'Connection limit reached. Close other streams and try again.';
+            case 'timeout':
+                return 'Stream not responding. Try again in a moment.';
+            default:
+                return "Couldn't reach stream. Try again later.";
         }
     }
 
